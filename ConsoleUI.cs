@@ -88,32 +88,51 @@ public sealed class ConsolePrompter : IUserPrompter
 }
 
 /// <summary>
-/// Prints "[0%] file name" for every file once (default color), then redraws that file's single line by
-/// moving the cursor: blue while in progress, green when done, red on failure. No extra lines are printed.
+/// Shows "[xx%] file name" lines that are redrawn in place (never appended).
+/// If there are more files than fit on screen, a window of rows that DOES fit is shown and it scrolls
+/// along with the file being processed. Colors: default = not started, cyan = running, green = done, red = failed.
 /// </summary>
 public sealed class ConsoleProgressReporter : IProgressReporter
 {
-    private const int StatusWidth = 6; // fits "[100%]" and "[FAIL]"
+    private enum State { Pending, Running, Done, Failed }
+
+    private const int StatusWidth = 6;   // fits "[100%]" and "[FAIL]"
+    private const int ReservedRows = 4;  // rows kept free: footer + prompts below the list
+    private const int RowsAboveActive = 3;
 
     // Cyan is the readable "blue" on dark consoles; ConsoleColor.Blue is very dark on a black background.
     private const ConsoleColor ProgressColor = ConsoleColor.Cyan;
     private const ConsoleColor DoneColor = ConsoleColor.Green;
     private const ConsoleColor FailColor = ConsoleColor.Red;
 
-    private IReadOnlyList<string> _labels = Array.Empty<string>();
-    private readonly List<(string Label, string Error)> _errors = new();
     private readonly object _gate = new(); // progress callbacks arrive on ffmpeg's output thread
-    private int[] _lastPercent = Array.Empty<int>();
-    private bool[] _done = Array.Empty<bool>();
-    private string[] _display = Array.Empty<string>(); // file names, already shortened to fit the window
-    private int _baseRow;
+    private readonly List<(string Label, string Error)> _errors = new();
+
+    private IReadOnlyList<string> _labels = Array.Empty<string>();
+    private string[] _names = Array.Empty<string>();   // file names shortened to fit the window
+    private State[] _state = Array.Empty<State>();
+    private int[] _percent = Array.Empty<int>();       // -1 = unknown
+    private int _baseRow;      // console row of the first visible file line
+    private int _visible;      // how many file lines are shown at once
+    private int _viewStart;    // index of the first file currently shown
+    private int _lineWidth;
+    private int _doneCount;
     private bool _interactive;
+
+    // Public entry points: every draw is serialized so cursor moves and writes never interleave.
+    public void Start(IReadOnlyList<string> labels) { lock (_gate) StartCore(labels); }
+    public void Begin(int index) { lock (_gate) BeginCore(index); }
+    public void Update(int index, double? percent) { lock (_gate) UpdateCore(index, percent); }
+    public void Complete(int index, bool success, string? error) { lock (_gate) CompleteCore(index, success, error); }
+    public void Finish() { lock (_gate) FinishCore(); }
 
     private void StartCore(IReadOnlyList<string> labels)
     {
         _labels = labels;
-        _lastPercent = Enumerable.Repeat(-1, labels.Count).ToArray();
-        _done = new bool[labels.Count];
+        _state = new State[labels.Count];
+        _percent = new int[labels.Count];
+        _viewStart = 0;
+        _doneCount = 0;
         _errors.Clear();
         _interactive = CanMoveCursor();
 
@@ -121,52 +140,56 @@ public sealed class ConsoleProgressReporter : IProgressReporter
 
         try { Console.CursorVisible = false; } catch (IOException) { }
 
-        int width = SafeWidth();
-        _display = labels.Select(l => Truncate(l, width - StatusWidth - 1)).ToArray();
+        _lineWidth = SafeWidth();
+        _names = labels.Select(l => Truncate(l, _lineWidth - StatusWidth - 1)).ToArray();
+        _visible = Math.Min(labels.Count, Math.Max(1, SafeHeight() - ReservedRows));
 
-        // Not started yet: default console color
-        for (int i = 0; i < labels.Count; i++)
-            Console.WriteLine(Line("0%", i));
+        // Reserve the rows (file lines + one footer line), then remember where they start.
+        for (int i = 0; i < _visible + 1; i++) Console.WriteLine();
+        _baseRow = Console.CursorTop - (_visible + 1);
+        if (_baseRow < 0) { _interactive = false; return; }
 
-        _baseRow = Console.CursorTop - labels.Count;
-        if (_baseRow < 0) _interactive = false; // scrolled past the buffer; stop redrawing
+        Draw(RedrawAll);
     }
 
     private void BeginCore(int index)
     {
+        _state[index] = State.Running;
+        _percent[index] = 0;
         if (!_interactive) return;
 
-        _lastPercent[index] = 0;
-        WriteStatus(index, "0%", ProgressColor); // in progress: blue
+        if (index < _viewStart || index >= _viewStart + _visible - 1)
+        {
+            _viewStart = Math.Clamp(index - RowsAboveActive, 0, _labels.Count - _visible);
+            Draw(RedrawAll);
+        }
+        else
+        {
+            Draw(() => DrawIndex(index));
+        }
     }
 
     private void UpdateCore(int index, double? percent)
     {
-        if (!_interactive || _done[index]) return; // ignore late ticks for finished files
+        if (_state[index] != State.Running) return; // ignore late ticks for finished files
 
-        if (percent is not { } p)
-        {
-            if (_lastPercent[index] != -2) WriteStatus(index, "...", ProgressColor);
-            _lastPercent[index] = -2;
-            return;
-        }
+        int whole = percent is { } p ? (int)Math.Clamp(Math.Floor(p), 0, 100) : -1;
+        if (whole == _percent[index]) return;        // redraw only when the number changes
 
-        int whole = (int)Math.Clamp(Math.Floor(p), 0, 100);
-        if (whole == _lastPercent[index]) return; // redraw only when the number changes
-
-        _lastPercent[index] = whole;
-        WriteStatus(index, $"{whole}%", ProgressColor);
+        _percent[index] = whole;
+        if (_interactive) Draw(() => DrawIndex(index));
     }
 
     private void CompleteCore(int index, bool success, string? error)
     {
-        _done[index] = true;
+        _state[index] = success ? State.Done : State.Failed;
+        _percent[index] = 100;
+        _doneCount++;
         if (!success) _errors.Add((_labels[index], error ?? "unknown error"));
 
         if (_interactive)
         {
-            if (success) WriteStatus(index, "100%", DoneColor);
-            else WriteStatus(index, "FAIL", FailColor);
+            Draw(() => { DrawIndex(index); DrawFooter(); MoveBelowList(); });
             return;
         }
 
@@ -178,7 +201,13 @@ public sealed class ConsoleProgressReporter : IProgressReporter
 
     private void FinishCore()
     {
-        if (_interactive) MoveBelowList();
+        if (_interactive)
+        {
+            _viewStart = Math.Max(0, _labels.Count - _visible); // leave the last files visible
+            Draw(RedrawAll);
+            Draw(MoveBelowList);
+        }
+
         try { Console.CursorVisible = true; } catch (IOException) { }
 
         foreach (var (label, error) in _errors)
@@ -189,30 +218,74 @@ public sealed class ConsoleProgressReporter : IProgressReporter
         }
     }
 
-    // Public entry points: every draw is serialized so cursor moves and writes never interleave.
-    public void Start(IReadOnlyList<string> labels) { lock (_gate) StartCore(labels); }
-    public void Begin(int index) { lock (_gate) BeginCore(index); }
-    public void Update(int index, double? percent) { lock (_gate) UpdateCore(index, percent); }
-    public void Complete(int index, bool success, string? error) { lock (_gate) CompleteCore(index, success, error); }
-    public void Finish() { lock (_gate) FinishCore(); }
+    // ---- drawing (always called under the lock) ----
 
-    private void WriteStatus(int index, string status, ConsoleColor? color)
+    private void Draw(Action drawing)
     {
-        try
-        {
-            Console.SetCursorPosition(0, _baseRow + index);
-            if (color is { } c) Console.ForegroundColor = c;
-            Console.Write(Line(status, index)); // same length every time (fixed-width status), so no padding that could wrap
-            if (color is not null) Console.ResetColor();
-            MoveBelowList();
-        }
+        try { drawing(); }
         catch (IOException) { _interactive = false; }
         catch (ArgumentOutOfRangeException) { _interactive = false; }
     }
 
-    private void MoveBelowList() => Console.SetCursorPosition(0, _baseRow + _labels.Count);
+    private void RedrawAll()
+    {
+        for (int row = 0; row < _visible; row++) DrawRow(row);
+        DrawFooter();
+        MoveBelowList();
+    }
 
-    private string Line(string status, int index) => $"{Status(status)} {_display[index]}";
+    private void DrawIndex(int index)
+    {
+        int row = index - _viewStart;
+        if (row >= 0 && row < _visible)
+        {
+            DrawRow(row);
+            MoveBelowList();
+        }
+    }
+
+    private void DrawRow(int row)
+    {
+        int index = _viewStart + row;
+        string status;
+        ConsoleColor? color;
+        switch (_state[index])
+        {
+            case State.Running:
+                status = _percent[index] < 0 ? "..." : $"{_percent[index]}%";
+                color = ProgressColor;
+                break;
+            case State.Done:
+                status = "100%";
+                color = DoneColor;
+                break;
+            case State.Failed:
+                status = "FAIL";
+                color = FailColor;
+                break;
+            default: // not started: default console color
+                status = "0%";
+                color = null;
+                break;
+        }
+
+        // Padded to a constant width (kept a few columns short of the window edge, so it never wraps),
+        // which also fully overwrites whatever file was on this row before.
+        string text = $"{Status(status)} {_names[index]}".PadRight(_lineWidth);
+
+        Console.SetCursorPosition(0, _baseRow + row);
+        if (color is { } c) Console.ForegroundColor = c;
+        Console.Write(text);
+        if (color is not null) Console.ResetColor();
+    }
+
+    private void DrawFooter()
+    {
+        Console.SetCursorPosition(0, _baseRow + _visible);
+        Console.Write($"Completed {_doneCount}/{_labels.Count}".PadRight(_lineWidth));
+    }
+
+    private void MoveBelowList() => Console.SetCursorPosition(0, _baseRow + _visible + 1);
 
     private static string Status(string text) => $"[{text}]".PadRight(StatusWidth);
 
@@ -230,6 +303,12 @@ public sealed class ConsoleProgressReporter : IProgressReporter
         catch (IOException) { return 120; }
     }
 
+    private static int SafeHeight()
+    {
+        try { return Console.WindowHeight; }
+        catch (IOException) { return 25; }
+    }
+
     private static string Truncate(string text, int width) =>
-        text.Length <= width ? text : text[..(width - 3)] + "...";
+        text.Length <= width ? text : text[..Math.Max(0, width - 3)] + "...";
 }
